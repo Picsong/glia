@@ -834,6 +834,14 @@ fn visit_top(
                 // value, the MODULE's.
                 if value.kind() == "identifier" {
                     push_value_ref(acc, module_id, text(value, src), line_at(value), None);
+                } else if value.kind() == "object" {
+                    // A module that IS an object literal — `export default {
+                    // async load() { return fetch({ url: '/api/x' }) } }`, the
+                    // shape ABC's `src/api/*.js` uses throughout. Its methods
+                    // are not nodes, so `collect_calls_in` never walks them
+                    // and none of their calls reach the graph. Walk the bodies
+                    // here with the MODULE as the source.
+                    collect_object_literal_bodies(value, src, module_id, acc);
                 }
             } else {
                 collect_reexport(n, src, module_id, acc);
@@ -2956,6 +2964,36 @@ fn collect_import(n: TsNode, src: &[u8], from_module: &str, acc: &mut Acc) {
 // Call collection
 // ============================================================================
 
+/// An object-literal module (`export default { … }`) owns no nodes of its own,
+/// so the method bodies `collect_calls_in` refuses to descend into
+/// (`method_definition` is "walked separately" — true only when a node owns
+/// it) would otherwise be walked by nobody. Walks those bodies with `from` as
+/// the source: `{ async load() {…} }`, `{ load: async () => {…} }` and
+/// `{ load: function () {…} }` alike.
+fn collect_object_literal_bodies(obj: TsNode, src: &[u8], from: NodeId, acc: &mut Acc) {
+    let mut cursor = obj.walk();
+    for prop in obj.named_children(&mut cursor) {
+        if prop.kind() == "method_definition" {
+            if let Some(body) = prop.child_by_field_name("body") {
+                collect_calls_in(body, src, from, None, acc);
+            }
+            continue;
+        }
+        if prop.kind() != "pair" {
+            continue;
+        }
+        let Some(value) = prop.child_by_field_name("value") else {
+            continue;
+        };
+        if !matches!(value.kind(), "arrow_function" | "function_expression") {
+            continue;
+        }
+        if let Some(body) = value.child_by_field_name("body") {
+            collect_calls_in(body, src, from, None, acc);
+        }
+    }
+}
+
 fn collect_calls_in(
     n: TsNode,
     src: &[u8],
@@ -4014,6 +4052,27 @@ fn try_detect_endpoint(
         None => return,
     };
 
+    // Shape 4 — `<wrapper>({ url, method })`: a project-local request wrapper
+    // called with a config object (`fetch({ url: '/api/x', method: 'post' })`).
+    // AbcPc's `src/api/*.js` is written this way, and shape 3 reads only a
+    // string first argument, so without this arm the call mints an ENDPOINT
+    // with an `<unresolved>` path — no anchor, nothing to find.
+    if func.kind() == "identifier"
+        && let Some((arg, method)) = config_object_call(call, src)
+    {
+        push_endpoint(
+            call,
+            from,
+            enclosing_class,
+            method.unwrap_or_else(|| "GET".to_string()),
+            arg,
+            CallBase::Fetch,
+            WireRead::default(),
+            acc,
+        );
+        return;
+    }
+
     // Shape 3 — `fetch(...)`.
     if func.kind() == "identifier" && text(func, src) == "fetch" {
         let args = match call.child_by_field_name("arguments") {
@@ -4112,13 +4171,25 @@ fn try_detect_endpoint(
         Some(n) => n,
         None => return,
     };
-    let arg = classify_path_arg(first, src);
+    let mut arg = classify_path_arg(first, src);
+    let mut method = method_lower.to_uppercase();
+    // CH.3d: `this.http.post({ url: '/api/x' })` — the verb is on the callee,
+    // the path inside the config object.
+    if arg.path == UNRESOLVED_PATH
+        && let Some((read, object_method)) = config_object_call(call, src)
+    {
+        arg = read;
+        // The callee's verb wins unless the object states one.
+        if let Some(verb) = object_method {
+            method = verb;
+        }
+    }
     let wire = member_call_wire(call, method_lower, args, awaited_generic, src);
     push_endpoint(
         if awaited_generic { func } else { call },
         from,
         enclosing_class,
-        method_lower.to_uppercase(),
+        method,
         arg,
         base,
         wire,
@@ -4189,6 +4260,58 @@ fn push_endpoint(
 
 fn classify_path_arg(arg: TsNode, src: &[u8]) -> PathArg {
     classify_at(arg, src, true)
+}
+
+/// CH.3d: a client call written as `<wrapper>({ url, method })` — the shape a
+/// project-local request wrapper takes. Returns the URL read and the verb;
+/// `None` unless the first argument is an object literal whose `url` reads as
+/// a static path with a `/`. `method` accepts a string literal only: a pair
+/// that is present but unreadable drops the path one confidence tier and
+/// falls back to GET, mirroring `fetch(url, opts)`.
+fn config_object_call(call: TsNode, src: &[u8]) -> Option<(PathArg, Option<String>)> {
+    let args = call.child_by_field_name("arguments")?;
+    let obj = args.named_child(0)?;
+    if obj.kind() != "object" {
+        return None;
+    }
+    let mut url: Option<PathArg> = None;
+    let mut method: Option<String> = None;
+    let mut opaque_method = false;
+    let mut cursor = obj.walk();
+    for prop in obj.named_children(&mut cursor) {
+        if prop.kind() != "pair" {
+            continue;
+        }
+        let (Some(key), Some(value)) = (
+            prop.child_by_field_name("key"),
+            prop.child_by_field_name("value"),
+        ) else {
+            continue;
+        };
+        let key_text = match key.kind() {
+            "property_identifier" => text(key, src).to_string(),
+            "string" => strip_string_quotes(text(key, src)),
+            _ => continue,
+        };
+        if key_text == "url" {
+            let read = classify_path_arg(value, src);
+            if read.path == UNRESOLVED_PATH || !read.static_text_has_slash() {
+                return None;
+            }
+            url = Some(read);
+        } else if key_text == "method" {
+            if value.kind() == "string" {
+                method = Some(strip_string_quotes(text(value, src)).to_uppercase());
+            } else {
+                opaque_method = true;
+            }
+        }
+    }
+    let mut url = url?;
+    if opaque_method {
+        url.confidence = downgrade(url.confidence);
+    }
+    Some((url, method))
 }
 
 /// CH.3a: read an HTTP call's URL argument from what the source states at the
@@ -7816,6 +7939,105 @@ function loadUsers(): void {
         assert!(
             parse.nodes.iter().any(|n| n.id == post_ep),
             "POST override missing"
+        );
+    }
+
+    #[test]
+    fn wrapper_config_object_emits_endpoint() {
+        // AbcPc's shape: a local wrapper imported under the name `fetch`, then
+        // called with `{ url, method }` instead of `(url, init)`.
+        let src = "\
+import fetch from 'utils/fetch';
+export async function searchGoods(data: any): Promise<any> {
+    return fetch({ url: '/api/v3/goods/search', method: 'post', data });
+}
+";
+        let parse = parse_file(
+            src,
+            "src/api/goods/index.ts",
+            "src::api::goods::index",
+            repo(),
+        )
+        .unwrap();
+
+        let ep = endpoint_id(repo(), "POST", "/api/v3/goods/search");
+        assert!(
+            parse.nodes.iter().any(|n| n.id == ep),
+            "config-object endpoint missing"
+        );
+        let fn_id = NodeId::from_parts(
+            GRAPH_TYPE,
+            repo(),
+            node_kind::FUNCTION,
+            "src::api::goods::index::searchGoods",
+        );
+        assert!(
+            has_edge(&parse, fn_id, ep, edge_category::CALLS),
+            "expected CALLS edge from searchGoods to the endpoint"
+        );
+    }
+
+    #[test]
+    fn wrapper_config_object_defaults_to_get() {
+        let src = "\
+export function load(): void {
+    fetch({ url: '/api/things' });
+}
+";
+        let parse = parse_file(src, "src/things.ts", "src::things", repo()).unwrap();
+        assert!(
+            parse
+                .nodes
+                .iter()
+                .any(|n| n.id == endpoint_id(repo(), "GET", "/api/things")),
+            "config object without method should read GET"
+        );
+    }
+
+    #[test]
+    fn module_object_literal_methods_are_walked() {
+        // `export default { … }` owns no nodes; its method bodies were walked
+        // by nobody, so every call in AbcPc's API modules was invisible.
+        let src = "\
+export default {
+    async load(data: any) {
+        return fetch({ url: '/api/v3/goods/load', method: 'post', data });
+    },
+};
+";
+        let parse = parse_file(
+            src,
+            "src/api/goods/load.ts",
+            "src::api::goods::load",
+            repo(),
+        )
+        .unwrap();
+        assert!(
+            parse
+                .nodes
+                .iter()
+                .any(|n| n.id == endpoint_id(repo(), "POST", "/api/v3/goods/load")),
+            "object-literal method body was not walked"
+        );
+    }
+
+    #[test]
+    fn member_verb_with_config_object_reads_url() {
+        let src = "\
+export class Api {
+    constructor(private readonly http: any) {}
+    load(): void {
+        this.http.post({ url: '/api/v3/things' });
+    }
+}
+";
+        let parse = parse_file(src, "src/api.ts", "src::api", repo()).unwrap();
+        assert!(
+            parse
+                .nodes
+                .iter()
+                .any(|n| n.id == endpoint_id(repo(), "POST", "/api/v3/things")),
+            "verb on the callee should survive the config-object read"
         );
     }
 
