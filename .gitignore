@@ -53,3 +53,7 @@ bench/substrate-gap/results.jsonl
 
 # Gradle build caches, created when a fixture probe runs gradle
 .gradle/
+
+# maturin 直接在 glia/ 里构建时的默认产物目录（发布用的是 monorepo 的 dist/）
+dist/
+.idea/
