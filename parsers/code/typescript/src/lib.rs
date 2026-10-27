@@ -2631,6 +2631,12 @@ fn visit_lexical(
                     .and_then(|nn| acc.const_vars.get(text(nn, src)).copied())
                     .unwrap_or(module_id);
                 collect_calls_in(value, src, from, None, acc);
+                // `const api = { load() { fetch({url}) } }` — the object's
+                // shorthand methods are `method_definition`, which
+                // `collect_calls_in` skips as "walked separately".
+                if value.kind() == "object" {
+                    collect_method_bodies(value, src, from, acc);
+                }
                 acc.value_stats.const_inits += 1;
             }
             continue;
@@ -2971,14 +2977,9 @@ fn collect_import(n: TsNode, src: &[u8], from_module: &str, acc: &mut Acc) {
 /// the source: `{ async load() {…} }`, `{ load: async () => {…} }` and
 /// `{ load: function () {…} }` alike.
 fn collect_object_literal_bodies(obj: TsNode, src: &[u8], from: NodeId, acc: &mut Acc) {
+    collect_method_bodies(obj, src, from, acc);
     let mut cursor = obj.walk();
     for prop in obj.named_children(&mut cursor) {
-        if prop.kind() == "method_definition" {
-            if let Some(body) = prop.child_by_field_name("body") {
-                collect_calls_in(body, src, from, None, acc);
-            }
-            continue;
-        }
         if prop.kind() != "pair" {
             continue;
         }
@@ -2989,6 +2990,20 @@ fn collect_object_literal_bodies(obj: TsNode, src: &[u8], from: NodeId, acc: &mu
             continue;
         }
         if let Some(body) = value.child_by_field_name("body") {
+            collect_calls_in(body, src, from, None, acc);
+        }
+    }
+}
+
+/// Bodies of an object literal's shorthand methods (`{ async load() { fetch(…) } }`):
+/// `method_definition` nodes are skipped by [`collect_calls_in`] as "walked
+/// separately", which only holds when something owns them as its own node.
+fn collect_method_bodies(obj: TsNode, src: &[u8], from: NodeId, acc: &mut Acc) {
+    let mut cursor = obj.walk();
+    for prop in obj.named_children(&mut cursor) {
+        if prop.kind() == "method_definition"
+            && let Some(body) = prop.child_by_field_name("body")
+        {
             collect_calls_in(body, src, from, None, acc);
         }
     }
@@ -8038,6 +8053,45 @@ export class Api {
                 .iter()
                 .any(|n| n.id == endpoint_id(repo(), "POST", "/api/v3/things")),
             "verb on the callee should survive the config-object read"
+        );
+    }
+
+    #[test]
+    fn const_object_shorthand_method_emits_endpoint_once() {
+        // ABC's `src/api/global.js`: the module object is bound to a const, and
+        // its members are shorthand methods (`load() {}`), not arrow properties.
+        let src = "\
+const api = {
+    loadCheck(clinicId, employeeId) {
+        return fetch({
+            url: `/api/global-auth/mb/employee/audit-check`,
+            method: 'get',
+            params: { clinicId, employeeId },
+        })
+    },
+    approve: (data) => {
+        return fetch({ url: `/api/global-auth/mb/employee/audit`, method: 'post', data });
+    },
+};
+export default api;
+";
+        let parse = parse_file(src, "src/api/global.js", "src::api::global", repo()).unwrap();
+        let hits = |m: &str, p: &str| {
+            parse
+                .nodes
+                .iter()
+                .filter(|n| n.id == endpoint_id(repo(), m, p))
+                .count()
+        };
+        assert_eq!(
+            hits("GET", "/api/global-auth/mb/employee/audit-check"),
+            1,
+            "shorthand method body should emit its endpoint exactly once"
+        );
+        assert_eq!(
+            hits("POST", "/api/global-auth/mb/employee/audit"),
+            1,
+            "arrow property must still emit exactly once (no double walk)"
         );
     }
 
